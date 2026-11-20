@@ -1,0 +1,129 @@
+name: Windows builds and releases
+
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  LLVM_MINGW_RELEASE: '20261117'
+  LLVM_MINGW_SHA256: '17db10bd2c0bcbf55e5e4382475190165d0fc90dfe52ca165a51f1dfb1ca19c8'
+
+jobs:
+  windows:
+    name: Windows ${{ matrix.arch }}
+    runs-on: windows-2022
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86
+            triplet: i686-w64-mingw32
+          - arch: x64
+            triplet: x86_64-w64-mingw32
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up the pinned toolchain
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'llvm-mingw'
+          $asset = "llvm-mingw-$($env:LLVM_MINGW_RELEASE)-msvcrt-x86_64"
+          $zip = Join-Path $env:RUNNER_TEMP "$asset.zip"
+          Invoke-WebRequest "https://github.com/mstorsjo/llvm-mingw/releases/download/$env:LLVM_MINGW_RELEASE/$asset.zip" -OutFile $zip
+          if ((Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:LLVM_MINGW_SHA256) {
+              throw 'Toolchain checksum mismatch'
+          }
+          Expand-Archive $zip -DestinationPath $dir
+          $bin = Join-Path $dir "$asset/bin"
+          if (-not (Test-Path $bin)) { $bin = Join-Path $dir 'bin' }
+          "MINGW_BIN=$bin" >> $env:GITHUB_ENV
+      - name: Build and test
+        shell: pwsh
+        env:
+          TRIPLET: ${{ matrix.triplet }}
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_SYSTEM_NAME=Windows -DCMAKE_BUILD_TYPE=Release "-DCMAKE_CXX_COMPILER=$env:MINGW_BIN/$($env:TRIPLET)-clang++.exe" "-DCMAKE_RC_COMPILER=$env:MINGW_BIN/$($env:TRIPLET)-windres.exe"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          cmake --build build --parallel 3
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ctest --test-dir build --output-on-failure
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+      - name: Make and exercise packages
+        shell: pwsh
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          $nsis = Join-Path ${env:ProgramFiles(x86)} 'NSIS/makensis.exe'
+          if (-not (Test-Path $nsis)) { $nsis = (Get-Command makensis.exe).Source }
+          python packaging/package.py build --arch $env:ARCH --exe build/DiscCenter.exe --out dist --makensis "$nsis"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./packaging/smoke.ps1 -Arch $env:ARCH -PackageDir dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: Publish a tagged build
+    if: github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    runs-on: ubuntu-latest
+    needs: windows
+    permissions:
+      contents: write
+    concurrency:
+      group: release-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: windows-*
+          merge-multiple: true
+          path: dist
+      - name: Validate release inputs
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          test "$RELEASE_TAG" = "v$(cat VERSION)"
+          test -s "release-notes/$RELEASE_TAG.md"
+          python3 packaging/package.py checksums --out dist
+          (cd dist && sha256sum -c SHA256SUMS.txt)
+          if [[ "$RELEASE_TAG" != *-* ]]; then
+            test -s "test-evidence/$RELEASE_TAG.md"
+          fi
+      - name: Upload and publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          options=()
+          if [[ "$RELEASE_TAG" == *-* ]]; then options+=(--prerelease); fi
+          if status=$(gh release view "$RELEASE_TAG" --json isDraft --jq .isDraft 2>&1); then
+            if [[ "$status" != true ]]; then
+              echo "The release is already published."
+              exit 1
+            fi
+          else
+            case "$status" in
+              *"release not found"*|*"HTTP 404"*) ;;
+              *) echo "$status" >&2; exit 1 ;;
+            esac
+            cp "release-notes/$RELEASE_TAG.md" release-body.md
+            printf '\n## SHA-256\n\n```text\n' >> release-body.md
+            cat dist/SHA256SUMS.txt >> release-body.md
+            printf '```\n' >> release-body.md
+            gh release create "$RELEASE_TAG" --verify-tag --draft "${options[@]}" \
+              --title "DiscCenter $RELEASE_TAG" --notes-file release-body.md
+          fi
+          gh release upload "$RELEASE_TAG" dist/* --clobber
+          expected=$(ls -1 dist | sort)
+          actual=$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort)
+          test "$expected" = "$actual"
+          gh release edit "$RELEASE_TAG" --draft=false

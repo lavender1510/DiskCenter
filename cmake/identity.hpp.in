@@ -1,0 +1,5 @@
+#pragma once
+namespace dc {
+inline constexpr wchar_t product_name[] = L"@DISCCENTER_NAME@";
+inline constexpr wchar_t version[] = L"@DISCCENTER_VERSION@";
+}
